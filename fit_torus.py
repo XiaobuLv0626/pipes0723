@@ -405,6 +405,10 @@ def fit_side(torus_points,torus_index):
             update_anchor(elbow,alternatives[0])
             update_anchor(elbow,alternatives[1])
             update_group_2(elbow,alternatives[0],alternatives[1])
+            o3d.visualization.draw_geometries(
+                [elbow.to_o3d_mesh(), globals.load_cylinders[alternatives[0][0]].to_o3d_mesh(), \
+                 globals.load_cylinders[alternatives[1][0]].to_o3d_mesh()])
+
             return elbow
 
     return None

@@ -67,7 +67,7 @@ def get_world_coord(align_angle,nor,center_coord,coord1,coord2):
 
 # 得到拐弯，p0、p1参考交付文档中的图示
 def get_elbow(p0,p1,angle,radius,nor,cy_tang_start=None):
-    cy_tang_start=(p1-p0)/np.linalg.norm(p1-p0)
+    cy_tang_start=-(p1-p0)/np.linalg.norm(p1-p0)
     # 计算夹角
     start_angle = 0 * np.pi
     end_angle = angle
