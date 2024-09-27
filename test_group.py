@@ -16,6 +16,7 @@ from get_elbow import get_elbow
 from pytorch3d.ops import knn_points, ball_query
 from sklearn.cluster import DBSCAN
 from group import Group
+from json_group_testing import get_torus_elbow
 
 
 def find_group(specific_id):
@@ -228,6 +229,68 @@ def find_instance_with_json_anchors(anchor_point, pointcloud):
     return min_inst
 
 
+def group_json_test(all_points, rad):
+    anchors = Anchor.load_anchors_from_json('parameters_cy_elbow_tee_anchor_group.json')
+    elbows = Torus.load_elbows_from_json("parameters_cy_elbow_tee_anchor_group.json")
+    tees = Tee.load_tees_from_json('parameters_cy_elbow_tee_anchor_group.json')
+
+    elbow_tee_anchor_list = get_torus_elbow(elbows, tees, anchors)
+
+    torus_pointcloud, _ = find_cloud_with_and_without_type(all_points, 11)
+    tees_pointcloud, _ = find_cloud_with_and_without_type(all_points, 12)
+
+    for elbow in elbows:
+        # 先找到这个基元在点云中对应的实例，直接找距离关键点最近的基元
+        points = np.asarray([anchors[elbow.p1_id].get_coord(), anchors[elbow.p2_id].get_coord()])
+        inst_num = find_instance_with_json_anchors(points, torus_pointcloud)
+        # 之后找关键点中距离最近的点进行打组
+        # 目前的问题是关键点之间的距离偏大，没法打出比较好的组
+        anchors_list = find_points_within_radius(points, elbow_tee_anchor_list, rad)
+        anchors_list = np.unique(anchors_list)
+        if len(anchors_list) > 2:
+            inst_list = []
+            for anchor in anchors_list:
+                if np.any(np.all(points == elbow_tee_anchor_list[anchor, :3], axis=1)):
+                    continue
+                if elbow_tee_anchor_list[anchor, 4] == -1:
+                    continue
+                if elbow_tee_anchor_list[anchor, 3] == 1:
+                    target_inst = find_instance_with_json_anchors(elbow_tee_anchor_list[anchor, :3], torus_pointcloud)
+                    inst_list.append([11, target_inst.astype(np.int32)])
+                if elbow_tee_anchor_list[anchor, 3] == 2:
+                    target_inst = find_instance_with_json_anchors(elbow_tee_anchor_list[anchor, :3], tees_pointcloud)
+                    inst_list.append([12, target_inst.astype(np.int32)])
+            inst_list.append([11, inst_num.astype(np.int32)])
+            inst_list = np.unique(inst_list, axis=0)
+            if len(inst_list) > 1:
+                grouping(inst_list)
+
+    for tee in tees:
+        points = np.asarray(
+            [anchors[tee.top1_id].get_coord(), anchors[tee.bottom1_id].get_coord(), anchors[tee.top2_id].get_coord()])
+        inst_num = find_instance_with_json_anchors(points, tees_pointcloud)
+        anchors_list = find_points_within_radius(points, elbow_tee_anchor_list, rad)
+        anchors_list = np.unique(anchors_list)
+        if len(anchors_list) > 3:
+            # 找关键点对应基元在点云中的编号，然后将其打组
+            inst_list = []
+            for anchor in anchors_list:
+                if np.any(np.all(points == elbow_tee_anchor_list[anchor, :3], axis=1)):
+                    continue
+                if elbow_tee_anchor_list[anchor, 4] == -1:
+                    continue
+                if elbow_tee_anchor_list[anchor, 3] == 1:
+                    target_inst = find_instance_with_json_anchors(elbow_tee_anchor_list[anchor, :3], torus_pointcloud)
+                    inst_list.append([11, target_inst.astype(np.int32)])
+                if elbow_tee_anchor_list[anchor, 3] == 2:
+                    target_inst = find_instance_with_json_anchors(elbow_tee_anchor_list[anchor, :3], tees_pointcloud)
+                    inst_list.append([12, target_inst.astype(np.int32)])
+            inst_list.append([12, inst_num.astype(np.int32)])
+            inst_list = np.unique(inst_list, axis=0)
+            if len(inst_list) > 1:
+                grouping(inst_list)
+
+
 if __name__ == "__main__":
     # Using Arguments
     parser = argparse.ArgumentParser()
@@ -263,7 +326,11 @@ if __name__ == "__main__":
         # print(inst_list)
         grouping(inst_list)
 
+    # test json using group
+    group_json_test(all_pipe_pointcloud, args.radius)
+
     # Finding Farthest Points in all torus
+    '''
     torus_pointcloud, other_pointcloud = find_cloud_with_and_without_type(all_pipe_pointcloud, 11)
 
     for i in tqdm(range(len(torus_pointcloud))):
@@ -274,8 +341,9 @@ if __name__ == "__main__":
         inst_list = np.unique(inst_list, axis=0)
         # print(inst_list)
         grouping(inst_list)
-
+    '''
     # Finding Farthest Points in all tees
+    '''
     tees_pointcloud, other_pointcloud = find_cloud_with_and_without_type(all_pipe_pointcloud, 12)
     for i in tqdm(range(len(tees_pointcloud))):
         ts_points = tees_pointcloud[i]
@@ -297,7 +365,7 @@ if __name__ == "__main__":
         inst_list = np.unique(inst_list, axis=0)
         # print(inst_list)
         grouping(inst_list)
-
+    '''
     # 按照组打印对应的点云，以查看打组结果
     '''
     for g in globals.save_groups:
