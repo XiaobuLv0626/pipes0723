@@ -1,22 +1,25 @@
 import argparse
-import math
+from distutils.command.clean import clean
+
 import numpy as np
 import open3d as o3d
 from tqdm import tqdm
 import torch
-import argparse
+from src.group import globals
 
-from cylinder import Cylinder
-from anchor import Anchor
-from torus import Torus
-from tee import Tee
-from tools import *
-import globals
-from get_elbow import get_elbow
-from pytorch3d.ops import knn_points, ball_query
+from geometry.cylinder import Cylinder
+from geometry.anchor import Anchor
+from geometry.torus import Torus
+from geometry.tee import Tee
+
+
+from pytorch3d.ops import ball_query
 from sklearn.cluster import DBSCAN
-from group import Group
-from json_group_testing import get_torus_elbow
+from src.group.group import Group
+from src.group.json_group_testing import get_torus_elbow
+from src.group.pointcloud_factory import FactoryPointcloud
+
+from group_direction import PipeGroupGraph, PipeGroupConstructor
 
 
 def find_group(specific_id):
@@ -36,50 +39,28 @@ def print_pointcloud_with_open3d(pointcloud):
     o3d.visualization.draw_geometries([pcd])
 
 
-def get_cylinder_points():
-    points_path = 'cylinders/cylinders_inst.npy'
-    points_data = np.load(points_path)
-    inst_nums = int(max(np.unique(points_data[:, 3])))
-    cylinder_points = []
-    for it in range(inst_nums):
-        inst_point = points_data[points_data[:, 3] == it, :3]
-        cylinder_points.append(inst_point)
-        # Visual Test
-        # print_pointcloud_with_open3d(inst_point)
-    return cylinder_points
+def load_inst_points_from_h2(singal, pc_path, la_path):
+    pcd = FactoryPointcloud(pc_path[-3:], pc_path, la_path)
 
-
-def load_inst_points_from_h2(points_path):
-    pcd = o3d.t.io.read_point_cloud(points_path)
-
-    points = np.asarray(pcd.point['positions'].numpy())
-    colors = np.asarray(pcd.point['colors'].numpy())
-    object_type = np.asarray(pcd.point['object_type'].numpy())
-    object_label = np.asarray(pcd.point['object_label'].numpy())
-    instance_type = np.asarray(pcd.point['instance_type'].numpy())
-    instance_label = np.asarray(pcd.point['instance_label'].numpy())
-    full_cloud = np.concatenate((points, colors, object_type, object_label, instance_type, instance_label), axis=1)
-
+    full_cloud = pcd.get_full_cloud()
     pipe_cloud = full_cloud[full_cloud[:, 6] == 1]
+    instance_label = np.unique(pipe_cloud[:, 9])
 
     # 离群点的first try，使用DBSCAN扫除离群点
     fl_cloud = np.empty((0, 10))
     inst_label = np.unique(instance_label)
-    for i in tqdm(inst_label):
+    for idx, i in tqdm(enumerate(inst_label)):
+        singal.emit(int(idx / len(inst_label) * 100))
         if i == -1:
             continue
-        i_cloud = full_cloud[full_cloud[:, 9] == i]
+        i_cloud = pipe_cloud[pipe_cloud[:, 9] == i]
         if i_cloud[0, 6] != 1:
             continue
         db = DBSCAN(eps=0.5, min_samples=10).fit(i_cloud[:, :3])
         labels = db.labels_
-        unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
-        if len(counts) == 0:
-            continue
-        largest_cluster_label = unique_labels[np.argmax(counts)]  # 最大簇的标签
-        # 提取出最大的簇的点
-        largest_cluster = i_cloud[labels == largest_cluster_label]
+        largest_cluster = i_cloud[labels != -1]
         fl_cloud = np.concatenate((fl_cloud, largest_cluster), axis=0)
+    singal.emit(0)
     pipe_cloud = fl_cloud[fl_cloud[:, 6] == 1]
     return full_cloud, pipe_cloud
 
@@ -96,18 +77,6 @@ def find_cloud_with_and_without_type(pointcloud, inst_type):
             type_pointcloud.append(np.concatenate((t_cloud[:, :3], t_cloud[:, 8:10]), axis=1))
 
     return type_pointcloud, not_type_pointcloud
-
-
-def clean_inst_with_dbscan(pointcloud):
-    db = DBSCAN(eps=0.3, min_samples=5).fit(pointcloud)
-    labels = db.labels_
-    unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
-    if len(counts) == 0:
-        return pointcloud
-    largest_cluster_label = unique_labels[np.argmax(counts)]  # 最大簇的标签
-    # 提取出最大的簇的点
-    largest_cluster = pointcloud[labels == largest_cluster_label]
-    return largest_cluster
 
 
 def find_inst_in_group(tid):
@@ -147,7 +116,15 @@ def grouping(insts):
     for inst in insts:
         group_id.append(find_inst_in_group(inst[1]))
     uni_group_id = np.unique(group_id, axis=0)
-    inst_names = ["cylinder", "elbow", "tees", "flange", "valve", 'instrument', 'support']
+    inst_names = [
+        "cylinder",
+        "elbow",
+        "tees",
+        "flange",
+        "valve",
+        'instrument',
+        'support',
+    ]
     if len(uni_group_id) == 1 and uni_group_id[0] == -1:
         # 若所有部分都不存在对应组，创建一个新的组，将整个部分放入组内
         group = Group(globals.group_tid)
@@ -198,8 +175,10 @@ def save_group_result(pointcloud, inst, output_path):
     pcd.point['positions'] = o3d.core.Tensor(pointcloud[:, :3], dtype=o3d.core.Dtype.Float32)
     pcd.point['colors'] = o3d.core.Tensor(pointcloud[:, 3:6], dtype=o3d.core.Dtype.Float32)
     pcd.point['inst_type'] = o3d.core.Tensor(pointcloud[:, 9].reshape(-1, 1), dtype=o3d.core.Dtype.Int32)
-    pcd.point['groups'] = o3d.core.Tensor(inst_to_gid[pointcloud[:, 9].astype(np.int32)].reshape(-1, 1),
-                                          dtype=o3d.core.Dtype.Int32)
+    pcd.point['groups'] = o3d.core.Tensor(
+        inst_to_gid[pointcloud[:, 9].astype(np.int32)].reshape(-1, 1),
+        dtype=o3d.core.Dtype.Int32,
+    )
     o3d.t.io.write_point_cloud(output_path, pcd)
 
 
@@ -229,10 +208,46 @@ def find_instance_with_json_anchors(anchor_point, pointcloud):
     return min_inst
 
 
-def group_json_test(all_points, rad):
-    anchors = Anchor.load_anchors_from_json('parameters_cy_elbow_tee_anchor_group.json')
-    elbows = Torus.load_elbows_from_json("parameters_cy_elbow_tee_anchor_group.json")
-    tees = Tee.load_tees_from_json('parameters_cy_elbow_tee_anchor_group.json')
+def create_inst_to_tid(all_points, parameters_cy_elbow_tee_anchor_group_pth):
+    # 得到标注编号到json tid的映射
+    anchors = Anchor.load_anchors_from_json(parameters_cy_elbow_tee_anchor_group_pth)
+    cylinders = Cylinder.load_cylinders_from_json(parameters_cy_elbow_tee_anchor_group_pth)
+    elbows = Torus.load_elbows_from_json(parameters_cy_elbow_tee_anchor_group_pth)
+    tees = Tee.load_tees_from_json(parameters_cy_elbow_tee_anchor_group_pth)
+
+    elbow_tee_anchor_list = get_torus_elbow(elbows, tees, anchors)
+
+    cy_pointcloud, _ = find_cloud_with_and_without_type(all_points, 10)
+    torus_pointcloud, _ = find_cloud_with_and_without_type(all_points, 11)
+    tees_pointcloud, _ = find_cloud_with_and_without_type(all_points, 12)
+
+    # 建立从标注序号到json tid的映射表（后续应先做统一）
+    inst_to_tid = {}
+    for cylinder in cylinders:
+        points = np.asarray([anchors[cylinder.top_id].get_coord(), anchors[cylinder.bottom_id].get_coord()])
+        inst_num = find_instance_with_json_anchors(points, cy_pointcloud)
+        inst_to_tid[inst_num] = cylinder.tid
+    for elbow in elbows:
+        points = np.asarray([anchors[elbow.p1_id].get_coord(), anchors[elbow.p2_id].get_coord()])
+        inst_num = find_instance_with_json_anchors(points, torus_pointcloud)
+        inst_to_tid[inst_num] = int(elbow.tid)
+    for tee in tees:
+        points = np.asarray(
+            [
+                anchors[tee.top1_id].get_coord(),
+                anchors[tee.bottom1_id].get_coord(),
+                anchors[tee.top2_id].get_coord(),
+            ]
+        )
+        inst_num = find_instance_with_json_anchors(points, tees_pointcloud)
+        inst_to_tid[inst_num] = int(tee.tid)
+    return inst_to_tid
+
+
+def group_json_test(all_points, rad, parameters_cy_elbow_tee_anchor_group_pth):
+    anchors = Anchor.load_anchors_from_json(parameters_cy_elbow_tee_anchor_group_pth)
+    elbows = Torus.load_elbows_from_json(parameters_cy_elbow_tee_anchor_group_pth)
+    tees = Tee.load_tees_from_json(parameters_cy_elbow_tee_anchor_group_pth)
 
     elbow_tee_anchor_list = get_torus_elbow(elbows, tees, anchors)
 
@@ -267,7 +282,12 @@ def group_json_test(all_points, rad):
 
     for tee in tees:
         points = np.asarray(
-            [anchors[tee.top1_id].get_coord(), anchors[tee.bottom1_id].get_coord(), anchors[tee.top2_id].get_coord()])
+            [
+                anchors[tee.top1_id].get_coord(),
+                anchors[tee.bottom1_id].get_coord(),
+                anchors[tee.top2_id].get_coord(),
+            ]
+        )
         inst_num = find_instance_with_json_anchors(points, tees_pointcloud)
         anchors_list = find_points_within_radius(points, elbow_tee_anchor_list, rad)
         anchors_list = np.unique(anchors_list)
@@ -291,91 +311,69 @@ def group_json_test(all_points, rad):
                 grouping(inst_list)
 
 
-if __name__ == "__main__":
-    # Using Arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-k", "--KNN_neighbor_num", default=3, help="Number of KNN in finding nearest element")
-    parser.add_argument("-r", "--radius", default=0.05, help="Radius of Bounding Sphere, consider 5cm(0.05)/10cm(0.1)")
-    args = parser.parse_args()
-    pointcloud_path = 'data/H2_grid_2_labels_remake_20240926.pcd'
-    result_path = "data/H2_group_first_try_0925.pcd"
+def load_points(
+    pc_path = '',
+    la_path = '',
+):
+    # 适应新版软件的编号，每种实例有自己连续的编号值
+    # 因此可以根据点云实例给定一个新的全局编号
+    pcd = FactoryPointcloud(pc_path[-3:], "src/group/inst_mapping.txt", pc_path, la_path)
 
-    # Using jsons
-    # json用cylinder/torus对应的parameter
-    globals.load_cylinders = Cylinder.load_cylinders_from_json('cylinders/parameters_cylinders_anchor.json')
-    globals.load_anchors = Anchor.load_anchors_from_json('cylinders/parameters_cylinders_anchor.json')
+    full_cloud = pcd.get_full_cloud()
+    downsample_step = int(100 / (100 - group_downsample_rate))
 
-    cylinder_ids = [cy.tid for cy in globals.load_cylinders]
-    # cylinders_pointcloud = get_cylinder_points()
-    full_cloud, all_pipe_pointcloud = load_inst_points_from_h2(pointcloud_path)
+    full_cloud = full_cloud[::downsample_step, :]
+    pipe_cloud = np.empty((0, 10))
+    type_list = []
 
-    # all the others
-    group = Group(globals.group_tid)
-    globals.group_tid += 1
-    globals.save_groups.append(group)
+    for t in range(10, 16):
+        type_cloud = full_cloud[full_cloud[:, 8] == t]
+        instance_label = np.unique(type_cloud[:, 9])
+        type_list.append(len(type_cloud))
+        for idx, i in tqdm(enumerate(instance_label)):
+            if i == -1:
+                continue
+            ith_cloud = type_cloud[type_cloud[:, 9] == i]
+            clean_res = DBSCAN(eps=0.5, min_samples=10).fit(ith_cloud)
+            labels = clean_res.labels_
+            pipe_cloud = np.concatenate((pipe_cloud, ith_cloud[labels != -1]), axis=0)
 
-    # Finding Farthest Points in all cylinders
-    cylinders_pointcloud, other_pointcloud = find_cloud_with_and_without_type(all_pipe_pointcloud, 10)
+    return pcd, full_cloud, pipe_cloud, type_list
 
-    for i in tqdm(range(len(cylinders_pointcloud))):
-        cy_points = cylinders_pointcloud[i]
-        cy_inst = cy_points[0, 4]
-        inst_list = get_group_inst(cy_points, other_pointcloud, args.radius)
-        inst_list.append([10, cy_inst])
-        inst_list = np.unique(inst_list, axis=0)
-        # print(inst_list)
-        grouping(inst_list)
 
-    # test json using group
-    group_json_test(all_pipe_pointcloud, args.radius)
 
-    # Finding Farthest Points in all torus
-    '''
-    torus_pointcloud, other_pointcloud = find_cloud_with_and_without_type(all_pipe_pointcloud, 11)
 
-    for i in tqdm(range(len(torus_pointcloud))):
-        tr_points = torus_pointcloud[i]
-        tr_inst = tr_points[0, 4]
-        inst_list = get_group_inst(tr_points, other_pointcloud, args.radius)
-        inst_list.append([11, tr_inst])
-        inst_list = np.unique(inst_list, axis=0)
-        # print(inst_list)
-        grouping(inst_list)
-    '''
-    # Finding Farthest Points in all tees
-    '''
-    tees_pointcloud, other_pointcloud = find_cloud_with_and_without_type(all_pipe_pointcloud, 12)
-    for i in tqdm(range(len(tees_pointcloud))):
-        ts_points = tees_pointcloud[i]
-        ts_inst = ts_points[0, 4]
-        ts_points = clean_inst_with_dbscan(ts_points[:, :3])
-        fps_samples_idx = farthest_points(ts_points)
 
-        dist_to_p1 = np.linalg.norm(ts_points - ts_points[fps_samples_idx[0]], axis=1)
-        dist_to_p2 = np.linalg.norm(ts_points - ts_points[fps_samples_idx[1]], axis=1)
-        third_point_idx = np.argmax(dist_to_p1 + dist_to_p2)
-        fps_samples_idx.append(third_point_idx)
-        all_points = ts_points
-        ind = find_points_within_radius(ts_points[fps_samples_idx], other_pointcloud, args.radius)
-        inst_list = []
-        for p in ind:
-            if other_pointcloud[p, 9] != -1:
-                inst_list.append(other_pointcloud[p, 8:10])
-        inst_list.append([12, ts_inst])
-        inst_list = np.unique(inst_list, axis=0)
-        # print(inst_list)
-        grouping(inst_list)
-    '''
-    # 按照组打印对应的点云，以查看打组结果
-    '''
-    for g in globals.save_groups:
-        print(f"Group {g.tid}: {g.get_parts()}")
-        pointcloud = np.empty((0, 3))
-        for inst in g.get_parts():
-            inst_points = all_pipe_pointcloud[(all_pipe_pointcloud[:, 9] == inst[1]), :3]
-            # print_pointcloud_with_open3D(inst_points)
-            pointcloud = np.vstack((pointcloud, inst_points))
-        print_pointcloud_with_open3d(pointcloud)
-    '''
-    # 将点云打组结果储存在pcd内
-    save_group_result(full_cloud, np.max(all_pipe_pointcloud[:, 9], axis=0), result_path)
+
+def get_group_list(
+    radius=0.05,
+    pointcloud_path='',
+    label_path='',
+    parameters_cylinders_pth='',
+    parameters_cy_elbow_tee_anchor_group_pth='',
+    result_path='',
+):
+
+    # data initialization
+    # pointcloud
+    pcd, full_cloud, all_pipe_pointcloud, type_list = load_points(pointcloud_path, label_path)
+    # json
+    globals.load_cylinders = Cylinder.load_cylinders_from_json(parameters_cylinders_pth)
+    globals.load_anchors = Anchor.load_anchors_from_json(parameters_cylinders_pth)
+    # 完全按照点云进行打组
+    pointcloud_grouping_constructor = PipeGroupConstructor(parameters_cylinders_pth, pcd)
+    for t in range(10, 12):
+        type_points = all_pipe_pointcloud[all_pipe_pointcloud[:, 8] == t]
+        for i in tqdm(range(type_list[t - 10])):
+            cur_points = type_points[type_points[:, 9] == i]
+            other_points = all_pipe_pointcloud[(all_pipe_pointcloud[:, 8] != t) | (all_pipe_pointcloud[:, 9] != i)]
+            farthest_sample = farthest_points(cur_points[:, 3])
+            ind = find_points_within_radius(cur_points[farthest_sample], other_points, radius)
+            for p in ind:
+                inst_type, inst_num = other_points[p, 8:10]
+                pointcloud_grouping_constructor.grouping_by_pcd(i, t, inst_num, inst_type)
+
+
+
+
+    # 根据拟合得到的json进行打组

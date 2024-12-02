@@ -20,6 +20,9 @@ class Group:
     def get_anchors(self):
         return self.anchors
 
+    def change_parts(self, parts):
+        self.parts = parts
+
     @classmethod
     def load_groups_from_json(cls, json_file: str) -> 'list[Anchor]':
         import json
